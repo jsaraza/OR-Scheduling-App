@@ -15,10 +15,12 @@ import { toast } from "@/components/ui/use-toast"
 const hours = Array.from({ length: 25 }, (_, i) => `${i.toString().padStart(2, "0")}:00`)
 
 interface Surgery {
-  orNumber: string
-  startTime: string
-  description: string
-  date: string
+  id: string;
+  orNumber: string;
+  startTime: string;
+  description: string;
+  date: string;
+  protocolLength: "short" | "long";
 }
 
 export default function Assignments() {
@@ -111,12 +113,14 @@ export default function Assignments() {
   }
 
   const handleSurgeryClick = (surgery: Surgery) => {
-    setSelectedSurgery(surgery)
+    setSelectedSurgery({
+      ...surgery
+    })
     setIsModalOpen(true)
   }
 
   const getCategoryColor = (category: string) => {
-    const colors = {
+    const colors: Record<string, string> = {
       Cardio: "bg-red-100 text-red-800",
       Thoracic: "bg-blue-100 text-blue-800",
       GenSurg: "bg-green-100 text-green-800",
