@@ -1,6 +1,4 @@
-# OR Scheduling App
- 
-# **Product Requirements Document (PRD)**
+# OR Scheduling App **Product Requirements Document (PRD)**
 **Project**: OR Nurse Assignment Application (Hybrid Approach)  
 
 ---
