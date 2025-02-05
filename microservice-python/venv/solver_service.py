@@ -1,4 +1,5 @@
 # solver_service.py
+import random
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
@@ -60,7 +61,8 @@ def solve_assignment(data: SolverInput):
     num_nurses = len(nurses)
 
     # Create decision variables:
-    # For each group (bay block) and each position (0, 1, 2), assign a nurse (by index in nurses list)
+    # For each group (bay block) and each position (0, 1, 2),
+    # assign a nurse (by index in the nurses list)
     group_vars = {}
     for g in range(num_groups):
         for pos in range(3):
@@ -144,8 +146,10 @@ def solve_assignment(data: SolverInput):
     model.Add(diff == max_load - min_load)
     model.Minimize(diff)
 
-    # --- Solve the Model ---
+    # --- Solve the Model with Randomization ---
     solver = cp_model.CpSolver()
+    # Set a random seed so that the solution can vary between runs
+    solver.parameters.random_seed = random.randint(0, 1000000)
     status = solver.Solve(model)
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         raise HTTPException(status_code=400, detail="No feasible assignment found.")
