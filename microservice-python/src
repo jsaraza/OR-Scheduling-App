@@ -1,0 +1,163 @@
+# solver_service.py
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+from ortools.sat.python import cp_model
+
+app = FastAPI(title="OR Nurse Assignment Solver")
+
+# ---------------------------
+# Input Models
+# ---------------------------
+class Nurse(BaseModel):
+    id: int
+    name: str
+    role: str           # "RN" or "LPN"
+    shift: str          # "early" or "late"
+    # Additional fields (shift start/end, previous assignments, etc.) can be added as needed.
+
+class BayPosition(BaseModel):
+    bay_id: int
+    duration_type: int  # 0 for short (30 min), 1 for long (45-60 min)
+    surgeries: int      # Number of surgeries in this OR (expected 1-6)
+    or_name: Optional[str] = None      # OR name/number (optional)
+    specialty: Optional[str] = None    # OR specialty/service (optional)
+
+class BayBlock(BaseModel):
+    block_id: int
+    # For each nurse position in the group, we have two bay positions.
+    # The fixed structure is:
+    #   pos0 (Nurse 1): bays[0] and bays[1]
+    #   pos1 (Nurse 2): bays[2] and bays[3]
+    #   pos2 (Nurse 3): bays[4] and bays[5]
+    bays: List[BayPosition]  # Must contain exactly 6 BayPosition items.
+
+class SolverInput(BaseModel):
+    nurses: List[Nurse]
+    bay_blocks: List[BayBlock]  # One bay block per group (for example, 10 blocks for 60 PCC bays)
+    # (Additional fields such as previous-day assignments for daily variety can be added later.)
+
+# ---------------------------
+# Solver Endpoint
+# ---------------------------
+@app.post("/solve")
+def solve_assignment(data: SolverInput):
+    model = cp_model.CpModel()
+
+    nurses = data.nurses
+    bay_blocks = data.bay_blocks
+
+    num_groups = len(bay_blocks)
+    num_nurses = len(nurses)
+
+    # Create decision variables:
+    # For each group (bay block) and for each position (0, 1, 2), assign a nurse (index into nurses list)
+    group_vars = {}
+    for g in range(num_groups):
+        for pos in range(3):
+            group_vars[(g, pos)] = model.NewIntVar(0, num_nurses - 1, f"group_{g}_pos_{pos}")
+
+    # Enforce that each nurse is assigned at most once (each nurse appears in at most one group)
+    all_vars = [group_vars[(g, pos)] for g in range(num_groups) for pos in range(3)]
+    model.AddAllDifferent(all_vars)
+
+    # --- Constraint: Shift Requirements ---
+    # Positions 0 and 1 (early positions) must be filled by nurses with an "early" shift.
+    # Position 2 must be filled by a nurse with a "late" shift.
+    for g in range(num_groups):
+        for pos in [0, 1]:
+            for idx, nurse in enumerate(nurses):
+                if nurse.shift != "early":
+                    model.Add(group_vars[(g, pos)] != idx)
+        for idx, nurse in enumerate(nurses):
+            if nurse.shift != "late":
+                model.Add(group_vars[(g, 2)] != idx)
+
+    # --- Constraint: Early Nurse Pairing Rule ---
+    # In each group, the two early nurses (positions 0 and 1) cannot both be LPN.
+    # (This ensures at least one RN among the early shift nurses.)
+    for g in range(num_groups):
+        for idx1, nurse1 in enumerate(nurses):
+            if nurse1.shift == "early" and nurse1.role == "LPN":
+                for idx2, nurse2 in enumerate(nurses):
+                    if nurse2.shift == "early" and nurse2.role == "LPN":
+                        model.AddBoolOr([
+                            group_vars[(g, 0)] != idx1,
+                            group_vars[(g, 1)] != idx2
+                        ])
+
+    # --- Constraint: Procedure Duration Check ---
+    # For each group and nurse position, verify that the corresponding bay pair yields one short and one long OR.
+    # This enforces that each nurse (assigned 2 bays) handles one short and one long procedure.
+    for g in range(num_groups):
+        bay_block = bay_blocks[g]
+        if len(bay_block.bays) != 6:
+            raise HTTPException(status_code=400, detail=f"Bay block {bay_block.block_id} must have exactly 6 bay positions.")
+        for pos, bay_indices in zip(range(3), [(0, 1), (2, 3), (4, 5)]):
+            d1 = bay_block.bays[bay_indices[0]].duration_type
+            d2 = bay_block.bays[bay_indices[1]].duration_type
+            if (d1, d2) not in [(0, 1), (1, 0)]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Bay block {bay_block.block_id} for group {g} has an invalid duration pairing for position {pos}."
+                )
+
+    # --- (Optional) Constraint: Workload Balancing ---
+    # For each nurse, compute the total surgery count from their assigned bays.
+    # This helps balance the workload among nurses.
+    nurse_load_vars = [model.NewIntVar(0, 1000, f"load_nurse_{i}") for i in range(num_nurses)]
+    nurse_load_contrib = {i: [] for i in range(num_nurses)}
+    for g in range(num_groups):
+        bay_block = bay_blocks[g]
+        for pos, bay_indices in zip(range(3), [(0, 1), (2, 3), (4, 5)]):
+            # Total surgeries for the two bays assigned to a nurse in this position.
+            surgeries = bay_block.bays[bay_indices[0]].surgeries + bay_block.bays[bay_indices[1]].surgeries
+            for i in range(num_nurses):
+                # Create a Boolean indicator that is 1 if nurse i is assigned to group g at position pos.
+                bvar = model.NewBoolVar(f"nurse_{i}_in_group_{g}_pos_{pos}")
+                model.Add(group_vars[(g, pos)] == i).OnlyEnforceIf(bvar)
+                model.Add(group_vars[(g, pos)] != i).OnlyEnforceIf(bvar.Not())
+                # Multiply the indicator by the surgery count.
+                load_contrib = model.NewIntVar(0, surgeries, f"load_g{g}_pos{pos}_nurse_{i}")
+                model.Add(load_contrib == surgeries * bvar)
+                nurse_load_contrib[i].append(load_contrib)
+    for i in range(num_nurses):
+        model.Add(nurse_load_vars[i] == sum(nurse_load_contrib[i]))
+
+    # (Optional) Objective: Minimize the difference between the maximum and minimum nurse load.
+    max_load = model.NewIntVar(0, 1000, "max_load")
+    min_load = model.NewIntVar(0, 1000, "min_load")
+    model.AddMaxEquality(max_load, nurse_load_vars)
+    model.AddMinEquality(min_load, nurse_load_vars)
+    diff = model.NewIntVar(0, 1000, "load_diff")
+    model.Add(diff == max_load - min_load)
+    model.Minimize(diff)
+
+    # --- Solve the Model ---
+    solver = cp_model.CpSolver()
+    status = solver.Solve(model)
+    if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+        raise HTTPException(status_code=400, detail="No feasible assignment found.")
+
+    # --- Construct the Response ---
+    result = {"groups": []}
+    for g in range(num_groups):
+        group_assignment = {}
+        # Generate a group label (e.g., A, B, C, …)
+        group_assignment["group_label"] = chr(65 + g) if g < 26 else f"Group_{g}"
+        for pos in range(3):
+            nurse_idx = solver.Value(group_vars[(g, pos)])
+            nurse = nurses[nurse_idx]
+            group_assignment[f"pos_{pos}"] = {
+                "nurse_id": nurse.id,
+                "name": nurse.name,
+                "role": nurse.role,
+                "shift": nurse.shift
+            }
+        # Include the bay block details for this group.
+        bay_block = bay_blocks[g]
+        group_assignment["bay_block"] = bay_block.dict()
+        # (Additional computed fields such as nurse load per group could be added here.)
+        result["groups"].append(group_assignment)
+
+    return result
