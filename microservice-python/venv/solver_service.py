@@ -91,8 +91,18 @@ def solve_assignment(data: SolverInput):
             if nurses[i].shift == "early" and nurses[i].role == "LPN":
                 for j in range(num_nurses):
                     if nurses[j].shift == "early" and nurses[j].role == "LPN" and i != j:
-                        # Prevent the assignment where pos0 is nurse i and pos1 is nurse j.
-                        model.AddBoolOr([group_vars[(g, 0)] != i, group_vars[(g, 1)] != j])
+                        # Create boolean variables for the conditions
+                        pos0_not_i = model.NewBoolVar(f'pos0_not_{i}_{g}')
+                        pos1_not_j = model.NewBoolVar(f'pos1_not_{j}_{g}')
+                        
+                        # Link the boolean variables to the conditions
+                        model.Add(group_vars[(g, 0)] != i).OnlyEnforceIf(pos0_not_i)
+                        model.Add(group_vars[(g, 0)] == i).OnlyEnforceIf(pos0_not_i.Not())
+                        model.Add(group_vars[(g, 1)] != j).OnlyEnforceIf(pos1_not_j)
+                        model.Add(group_vars[(g, 1)] == j).OnlyEnforceIf(pos1_not_j.Not())
+                        
+                        # Add the constraint that at least one must be true
+                        model.AddBoolOr([pos0_not_i, pos1_not_j])
 
     # Define the bay pair mapping according to the PRD:
     # pos0 (Nurse 1): indices (0,1)
